@@ -8,22 +8,25 @@
 # missing names before that import happens.
 
 # TODO: Remove after qeff upgrade torch to >= 2.8.0
-import torch.fx._graph_pickler as _gp
+from vllm.platforms import current_platform
 
-if not hasattr(_gp, "Options"):
-    from dataclasses import dataclass
-    from collections.abc import Callable
+if current_platform.is_aot:
+    import torch.fx._graph_pickler as _gp
 
-    @dataclass
-    class Options:
-        ops_filter: Callable[[str], bool] | None = None
+    if not hasattr(_gp, "Options"):
+        from dataclasses import dataclass
+        from collections.abc import Callable
 
-    _gp.Options = Options  # type: ignore[attr-defined]
+        @dataclass
+        class Options:
+            ops_filter: Callable[[str], bool] | None = None
 
-    _original_dumps = _gp.GraphPickler.dumps.__func__  # type: ignore[attr-defined]
+        _gp.Options = Options  # type: ignore[attr-defined]
 
-    @classmethod  # type: ignore[misc]
-    def _dumps_compat(cls, obj: object, options: Options | None = None) -> bytes:  # type: ignore[name-defined]
-        return _original_dumps(cls, obj)
+        _original_dumps = _gp.GraphPickler.dumps.__func__  # type: ignore[attr-defined]
 
-    _gp.GraphPickler.dumps = _dumps_compat  # type: ignore[method-assign]
+        @classmethod  # type: ignore[misc]
+        def _dumps_compat(cls, obj: object, options: Options | None = None) -> bytes:  # type: ignore[name-defined]
+            return _original_dumps(cls, obj)
+
+        _gp.GraphPickler.dumps = _dumps_compat  # type: ignore[method-assign]

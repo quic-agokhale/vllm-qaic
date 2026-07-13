@@ -60,8 +60,7 @@ class QaicPlatform(Platform):
     device_type: str = "cpu" if isinstance(qaic, PlaceholderModule) else "qaic"
     device_control_env_var: str = "QAIC_VISIBLE_DEVICES"
     supported_quantization: list[str] = QAIC_QUANTIZATION_LIST
-    # for eager mode
-    simple_compile_backend: str = "eager"
+    simple_compile_backend: str = "inductor"
 
     _torch_qaic_installed: bool = importlib.util.find_spec("torch_qaic") is not None
     is_aot = not _torch_qaic_installed
@@ -199,22 +198,19 @@ class QaicPlatform(Platform):
                         f"got {type(cfg).__name__!r}"
                     )
                 vllm_config.additional_config = cfg
-
+        from vllm.config import CompilationMode
         if cls.is_aot:
-            if vllm_config.model_config.enforce_eager:
-                logger.warning_once(
-                    "setting inference mode to Ahead-of-Time since"
-                    "torch_qaic is not installed"
-                )
-                vllm_config.model_config.enforce_eager = False
+            logger.warning_once(
+                "setting inference mode to Ahead-of-Time since"
+                "torch_qaic is not installed"
+            )
+            vllm_config.model_config.enforce_eager = False
+            vllm_config.compilation_config.mode = CompilationMode.NONE
             device_config.device = torch.device("cpu")
         else:
-            if not vllm_config.model_config.enforce_eager:
-                logger.warning_once(
-                    "setting inference mode to Eager mode since torch_qaic is installed"
-                )
-                vllm_config.model_config.enforce_eager = True
             device_config.device = torch.device("qaic")
+            if vllm_config.compilation_config.compile_sizes is None:
+                vllm_config.compilation_config.compile_sizes = []
             # set QAIC_VISIBLE_DEVICES from device_group
             # if not already set
             if (
@@ -251,10 +247,9 @@ class QaicPlatform(Platform):
             parallel_config.worker_cls = cls.get_worker_cls()
 
         if parallel_config.world_size > 1:
-            parallel_config.distributed_executor_backend = "uni"
-            if vllm_config.model_config.enforce_eager:
-                # uni backend sets qualnet ip while mp backend sets localhost ip
-                parallel_config.distributed_executor_backend = "mp"
+            parallel_config.distributed_executor_backend = "mp"
+            if cls.is_aot:
+                parallel_config.distributed_executor_backend = "uni"
 
         model_config = vllm_config.model_config
         scheduler_config = vllm_config.scheduler_config
@@ -298,7 +293,7 @@ class QaicPlatform(Platform):
 
         cache_config = vllm_config.cache_config
         if cache_config:
-            if model_config.enforce_eager:
+            if not cls.is_aot:
                 cache_config.block_size = 16
             else:
                 if cache_config.enable_prefix_caching:
@@ -359,20 +354,6 @@ class QaicPlatform(Platform):
                 os.environ["KMP_PLAIN_BARRIER_PATTERN"] = "dist,dist"
                 os.environ["KMP_REDUCTION_BARRIER_PATTERN"] = "dist,dist"
 
-        from vllm.config import CompilationMode
-
-        compilation_config = vllm_config.compilation_config
-        # QAIC_FIXME: default uses torch.compile based custom vllm-backend.
-        # Turning off all torch.compile modes to fallback to purely eager for now.
-        if compilation_config and compilation_config.mode != CompilationMode.NONE:
-            mode = "eager mode" if vllm_config.model_config.enforce_eager else "AOT"
-            logger.warning_once(
-                "vllm qaic platform doesn't support compilation mode = %s,"
-                "disabling and running with %s...",
-                compilation_config.mode,
-                mode,
-            )
-            compilation_config.mode = CompilationMode.NONE
         on_device_sampling_en = override_qaic_config.get("aic_include_sampler", False)
         if isinstance(on_device_sampling_en, str):
             on_device_sampling_en = on_device_sampling_en.lower() in [

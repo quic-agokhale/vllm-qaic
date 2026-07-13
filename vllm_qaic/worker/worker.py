@@ -201,7 +201,6 @@ class QaicWorkerPyt(QaicWorker):
             distributed_init_method=distributed_init_method,
             is_driver_worker=is_driver_worker,
         )
-        assert self.model_config.enforce_eager
         self.parallel_config.disable_custom_all_reduce = True
 
         # configure float32 matmul precision according to vLLM env.

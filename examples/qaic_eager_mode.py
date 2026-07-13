@@ -40,7 +40,6 @@ llm = LLM(
     # but does account for prompt and generated tokens)
     enable_prefix_caching=False,
     gpu_memory_utilization=0.9,
-    enforce_eager=True,
     async_scheduling=False,
     long_prefill_token_threshold=seq_len,
     tensor_parallel_size=1,
