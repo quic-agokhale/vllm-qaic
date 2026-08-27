@@ -13,7 +13,7 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm_qaic.logger import init_logger
-from vllm.platforms import CpuArchEnum, current_platform
+from vllm.platforms import CpuArchEnum
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionImpl,
@@ -145,7 +145,10 @@ class QAicAttentionMetadataBuilder(AttentionMetadataBuilder[QAicAttentionMetadat
         self.block_size = vllm_config.cache_config.block_size
 
     def update_req_ids(self, req_ids: list[str]) -> None:
-        """Called by the model runner before build() to supply the current batch's request IDs."""
+        """Supply the current batch's request IDs.
+
+        Called by the model runner before build().
+        """
         self.current_req_ids = req_ids
 
     def build(
@@ -154,7 +157,6 @@ class QAicAttentionMetadataBuilder(AttentionMetadataBuilder[QAicAttentionMetadat
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> QAicAttentionMetadata:
-        num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         max_query_len = common_attn_metadata.max_query_len
         max_seq_len = common_attn_metadata.max_seq_len
@@ -180,7 +182,6 @@ class QAicAttentionMetadataBuilder(AttentionMetadataBuilder[QAicAttentionMetadat
                 decode_threshold=self.reorder_batch_threshold,
                 require_uniform=True,
             )
-            num_reqs = num_decodes + num_prefills
 
         scheduler_metadata = None
 
@@ -331,8 +332,8 @@ class QAicAttentionBackendImpl(AttentionImpl):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        attn_metadata: QAicAttentionMetadata | None,
-        output: torch.Tensor | None = None,
+        attn_metadata: QAicAttentionMetadata,
+        output: torch.Tensor,
     ) -> torch.Tensor:
         """
         Run SDPA for decode attention across a batch of sequences.
@@ -432,24 +433,44 @@ class QAicAttentionBackendImpl(AttentionImpl):
             Lq = num_new
             Lk = new_cached
 
-            # Decode (Lq=1): full KV context, no mask needed.
-            # Prefill / chunked-prefill: causal mask over [Lq x Lk].
-            if Lq == 1:
-                mask = None
+            # Causal mask over [Lq x Lk]. Query row qi sits at absolute
+            # position (Lk - Lq) + qi in the sequence, so the same expression
+            # covers decode (Lq == 1) and prefill/chunked-prefill alike, and
+            # lets the sliding window be applied per query row rather than
+            # only along a fixed diagonal.
+            q_pos = torch.arange(Lk - Lq, Lk, device=q.device).unsqueeze(1)
+            k_pos = torch.arange(Lk, device=q.device).unsqueeze(0)
+            mask = k_pos <= q_pos
+            left = self.sliding_window[0]
+            if left != -1:
+                mask = mask & ((q_pos - k_pos) <= left)
+
+            if self.sinks is None:
+                sdpa_out = torch.nn.functional.scaled_dot_product_attention(
+                    q[None],  # [1, num_heads, Lq, head_size]
+                    k[None],
+                    v[None],
+                    attn_mask=mask,
+                    dropout_p=0.0,
+                    is_causal=False,
+                    scale=self.scale,
+                )  # [1, num_heads, Lq, head_size]
             else:
-                mask = torch.ones(Lq, Lk, device=q.device, dtype=torch.bool).tril(
-                    diagonal=(Lk - Lq)
+                # Attention sinks (gpt-oss): a learned per-head logit that
+                # joins the softmax denominator but contributes no value row,
+                # so it damps attention when no key is a good match. SDPA has
+                # no way to express that, hence the explicit scoring here.
+                scores = torch.matmul(q.float(), k.float().transpose(-1, -2))
+                scores = scores * self.scale
+                scores = scores.masked_fill(~mask, float("-inf"))
+                sink = (
+                    self.sinks.to(scores.dtype)
+                    .view(-1, 1, 1)
+                    .expand(scores.shape[0], Lq, 1)
                 )
-            # breakpoint()
-            sdpa_out = torch.nn.functional.scaled_dot_product_attention(
-                q[None],  # [1, num_heads, Lq, head_size]
-                k[None],
-                v[None],
-                attn_mask=mask,
-                dropout_p=0.0,
-                is_causal=False,
-                scale=self.scale,
-            )  # [1, num_heads, Lq, head_size]
+                probs = torch.softmax(torch.cat([scores, sink], dim=-1), dim=-1)
+                # Drop the sink column before the value matmul.
+                sdpa_out = torch.matmul(probs[..., :Lk], v.float()).to(q.dtype)[None]
 
             output[tok_start:tok_end] = sdpa_out.squeeze(0).movedim(1, 0)
 
@@ -495,6 +516,7 @@ class QAicAttentionBackendImpl(AttentionImpl):
         causal_attn = attn_type == AttentionType.DECODER
 
         sdpa_start_loc = attn_metadata.sdpa_start_loc  # .numpy()  # type: ignore
+        assert sdpa_start_loc is not None
         for i in range(len(attn_masks)):
             mask = attn_masks[i]
             start_q = sdpa_start_loc[i]
